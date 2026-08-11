@@ -93,12 +93,22 @@ export async function setChecked(page, selector, checked = true) {
 }
 
 export async function fillContentEditable(page, selector, value) {
-  await page.$eval(selector, (el, target) => {
-    if (!el.isContentEditable) throw new Error('Element is not contenteditable');
-    el.focus();
-    el.textContent = target;
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: target }));
-  }, value);
+  const handle = await page.$(selector);
+  if (!handle) throw new Error(`Element not found: ${selector}`);
+  const editable = await handle.evaluate(el => Boolean(el.isContentEditable));
+  if (!editable) {
+    await handle.dispose();
+    throw new Error('Element is not contenteditable');
+  }
+  // Draft.js / React controlled editors ignore direct textContent mutation;
+  // real keystrokes are the only reliable input path.
+  await handle.evaluate(el => el.focus());
+  await page.keyboard.down('Control');
+  await page.keyboard.press('A');
+  await page.keyboard.up('Control');
+  await page.keyboard.press('Backspace');
+  await page.keyboard.type(value, { delay: 10 });
+  await handle.dispose();
   return true;
 }
 

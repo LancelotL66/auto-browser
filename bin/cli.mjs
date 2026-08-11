@@ -68,6 +68,23 @@ function saveSnapshot(map) {
 }
 
 // ------------------------------------------------------------
+// Bound a single CDP/browser call so a stuck page can't hang the
+// whole CLI command. Puppeteer's ElementHandle.hover()/click() run
+// CDP DOM.scrollIntoViewIfNeeded internally, which can block forever
+// on long/dynamic pages (observed: 90s hang on Zhihu — only the
+// process-wide watchdog saved us). The watchdog stays as the last
+// resort; these per-call timeouts turn a hang into a fast, actionable
+// error at the exact call site.
+// ------------------------------------------------------------
+function withTimeout(promise, ms, label = 'cdp-call') {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ------------------------------------------------------------
 // Render one element as a single self-describing CLI line:
 //   @e37  link      [click,open]  "SQL快速入门"  -> https://...
 // An agent can read kind + actions and immediately know which
@@ -181,20 +198,34 @@ async function resolveRef(page, value) {
         return `/${parts.join('/')}`;
       };
       const distance = (a, b) => Math.hypot((a.x || 0) - (b.x || 0), (a.y || 0) - (b.y || 0));
+      const interactive = node => {
+        const t = node.tagName;
+        if (['BUTTON', 'A', 'INPUT', 'TEXTAREA', 'SELECT', 'LABEL', 'OPTION'].includes(t)) return true;
+        if (node.getAttribute('role') || node.isContentEditable) return true;
+        if (node.hasAttribute('onclick') || node.hasAttribute('tabindex')) return true;
+        const cls = typeof node.className === 'string' ? node.className : '';
+        return /(el-button|ant-btn|MuiButton|el-select|ant-select|el-input|el-checkbox|el-radio|el-switch|el-tabs|el-dropdown|el-upload|Mui[A-Z]|btn|clickable|cursor-pointer)/.test(cls);
+      };
       const scored = candidates.map(node => {
         const currentRect = node.getBoundingClientRect();
         const currentName = accessibleName(node);
         const currentParent = node.parentElement?.textContent.trim().slice(0, 120) || '';
         let score = 0;
         if (role && node.getAttribute('role') === role) score += 35;
-        if (name && currentName === name) score += 35;
-        else if (name && currentName && currentName.includes(name)) score += 15;
+        if (name && currentName === name) score += 45;
+        else if (name && currentName && currentName.includes(name)) score += 5;
         if (text && node.textContent.trim() === text) score += 15;
         if (placeholder && node.getAttribute('placeholder') === placeholder) score += 25;
         if (parentText && currentParent === parentText) score += 10;
         const positionDistance = distance(currentRect, rect);
         if (positionDistance < 40) score += 15;
         else if (positionDistance < 150) score += 8;
+        else if (positionDistance < 400) score -= 20;
+        else score -= 40;   // far away: needs a very strong identity match
+        // Stat/counter text ("12.6k", "1,024", "294") is almost never the target.
+        if (/^[\d.,+\-%\s万kKmM倍条个赞人/]*$/.test(currentName.slice(0, 40))) score -= 25;
+        // Non-interactive text nodes must not outscore the real control.
+        if (!interactive(node)) score -= 40;
         if (node.disabled || node.getAttribute('aria-disabled') === 'true') score -= 25;
         return { node, score, xpath: path(node) };
       }).sort((a, b) => b.score - a.score);
@@ -209,12 +240,14 @@ async function resolveRef(page, value) {
       rect: element.rect,
       parentText: element.parentText
     });
-    if (match && match.score >= 50) {
+    if (match && match.score >= 60) {
       handle = await context.$(`xpath${match.xpath}`);
       if (handle) {
         method = `semantic (${match.candidates} candidates)`;
         confidence = match.score;
       }
+    } else if (match) {
+      console.warn(`Warning: ${value} — nearest semantic candidate scored ${match.score} (< 60). The page likely changed structurally; run "snap" to rebuild references instead of clicking a guess.`);
     }
   }
   if (handle) {
@@ -505,6 +538,16 @@ function collectSignalsInPage() {
     url: location.href,
     title: document.title,
     textLength: document.body?.innerText?.length || 0,
+    // Cheap fingerprint of the rendered text: catches same-length text swaps
+    // ("hover me" -> "hovered!", 8 vs 8 chars) that a length comparison alone
+    // misses. Bounded to the first 200KB so huge pages stay cheap.
+    textHash: (() => {
+      const t = document.body?.innerText || '';
+      let h = 0;
+      const n = Math.min(t.length, 200000);
+      for (let i = 0; i < n; i++) h = (h * 31 + t.charCodeAt(i)) >>> 0;
+      return h;
+    })(),
     domLength: document.documentElement?.outerHTML?.length || 0,
     dialogs: document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length,
     alerts, toasts, errText, validation,
@@ -512,7 +555,7 @@ function collectSignalsInPage() {
   };
 }
 
-const _emptySignals = () => ({ url: '', title: '', textLength: 0, domLength: 0, dialogs: 0, alerts: [], toasts: [], errText: [], validation: [], modals: [], masked: false, pending: false, verdict: null });
+const _emptySignals = () => ({ url: '', title: '', textLength: 0, textHash: 0, domLength: 0, dialogs: 0, alerts: [], toasts: [], errText: [], validation: [], modals: [], masked: false, pending: false, verdict: null });
 
 async function captureSignals(page) {
   const withTimeout = p => Promise.race([
@@ -568,7 +611,7 @@ async function observeReaction(page, before, opts = {}) {
     const next = await captureSignals(page);
     if (next.domLength === lastDom) stable++; else { stable = 0; lastDom = next.domLength; }
     after = next;
-    const changedVsBefore = after.url !== before.url || after.domLength !== before.domLength || after.title !== before.title;
+    const changedVsBefore = after.url !== before.url || after.domLength !== before.domLength || after.title !== before.title || after.textHash !== before.textHash;
     if (stable >= 2 && changedVsBefore) break; // settled after a real change
     if (stable >= 3) break;                    // settled, nothing happened
   }
@@ -586,7 +629,7 @@ async function observeReaction(page, before, opts = {}) {
     || (process.env.AUTO_BROWSER_RESULT_TIMEOUT !== undefined ? Number(process.env.AUTO_BROWSER_RESULT_TIMEOUT) : 15000);
   const navigatedEarly = Boolean(after.url && before.url && after.url !== before.url);
   const changedNow = after.url !== before.url || after.domLength !== before.domLength ||
-    after.title !== before.title || after.textLength !== before.textLength;
+    after.title !== before.title || after.textLength !== before.textLength || after.textHash !== before.textHash;
   const signalNow = s =>
     _diffText(before.alerts, s.alerts).length || _diffText(before.toasts, s.toasts).length ||
     _diffText(before.errText, s.errText).length || _diffText(before.modals, s.modals).length ||
@@ -630,7 +673,7 @@ async function observeReaction(page, before, opts = {}) {
   const navigated = after.url && before.url && after.url !== before.url;
   const changed = navigated || after.title !== before.title ||
     after.textLength !== before.textLength || after.domLength !== before.domLength ||
-    after.dialogs !== before.dialogs;
+    after.textHash !== before.textHash || after.dialogs !== before.dialogs;
   const hasSignal = Boolean(
     dialogs.length || consoleErrors.length || pageErrors.length ||
     alerts.length || toasts.length || errors.length || validation.length ||
@@ -755,16 +798,36 @@ async function flagActionRequired(page, r, { interactive = true } = {}) {
 
 // Shared post-action reporter: prints the action line + the settled reaction.
 // Every action command routes through here so coverage is uniform.
-async function reportAction(page, before, actionLine) {
+// opts.retry: optional async () => boolean. When the action produced ZERO
+// feedback (no change, no signal, no navigation), the retry runs once and the
+// reaction is re-observed. Used by `click` for the native-DOM-click fallback —
+// some frameworks (React controlled components, Zhihu buttons) ignore synthetic
+// CDP mouse events entirely but respond to el.click().
+async function reportAction(page, before, actionLine, opts = {}) {
   const json = args.includes('--json');
-  const reaction = await observeReaction(page, before);
+  let reaction = await observeReaction(page, before);
+  let retried = false;
+
+  if (opts.retry
+    && !reaction.changed && !reaction.hasSignal && !reaction.navigated
+    && !reaction.blockedNow && !_reactionEvents.dialogs.length) {
+    const before2 = await captureSignals(page);
+    resetReactionEvents();
+    const ok = await opts.retry();
+    if (ok) {
+      retried = true;
+      reaction = await observeReaction(page, before2);
+    }
+  }
+
   if (json) {
     const req = actionRequiredReason(reaction);
     if (req) process.exitCode = EXIT_ACTION_REQUIRED;
-    console.log(JSON.stringify({ result: actionLine, reaction, actionRequired: req || null }, null, 2));
+    console.log(JSON.stringify({ result: actionLine, reaction, actionRequired: req || null, retried }, null, 2));
     return reaction;
   }
   console.log(actionLine + (reaction.changed ? ' (result=changed)' : ' (result=no-observable-change)'));
+  if (retried) console.log('(retried with native DOM click — js-fallback)');
   printReaction(reaction);
   await flagActionRequired(page, reaction);
   return reaction;
@@ -1617,15 +1680,25 @@ async function main() {
         }
         const before = await captureSignals(page);
         resetReactionEvents();
-        const box = await resolved.handle.boundingBox();
+        const box = await withTimeout(resolved.handle.boundingBox(), 5000, 'boundingBox');
         if (box) {
           await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
         } else {
-          await resolved.handle.click();
+          // No layout box: fall back to a native DOM click (also avoids
+          // puppeteer's hang-prone scrollIntoViewIfNeeded path).
+          await resolved.handle.evaluate(el => el.click());
         }
-        await resolved.handle.dispose();
         const el = resolved.element;
-        await reportAction(page, before, `Clicked @${el.ref}: <${el.tag}> "${String(el.text || '').slice(0, 40)}" (re-located)`);
+        await reportAction(page, before, `Clicked @${el.ref}: <${el.tag}> "${String(el.text || '').slice(0, 40)}" (re-located)`, {
+          retry: async () => {
+            const ok = await resolved.handle.evaluate(node => {
+              if (node.isConnected && typeof node.click === 'function') { node.click(); return true; }
+              return false;
+            }).catch(() => false);
+            return ok;
+          }
+        });
+        await resolved.handle.dispose();
         break;
       }
 
@@ -1638,14 +1711,22 @@ async function main() {
         // Use a raw mouse click at the element's box center (like the @ref path)
         // instead of puppeteer's awaited el.click(), which can hang when the
         // element is covered by an overlay/modal.
-        const box = await el.boundingBox();
+        const box = await withTimeout(el.boundingBox(), 5000, 'boundingBox');
         if (box) {
           await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
         } else {
-          await el.click();
+          await el.evaluate(node => node.click());
         }
+        await reportAction(page, before, `Clicked: ${args[0]}`, {
+          retry: async () => {
+            const ok = await el.evaluate(node => {
+              if (node.isConnected && typeof node.click === 'function') { node.click(); return true; }
+              return false;
+            }).catch(() => false);
+            return ok;
+          }
+        });
         await el.dispose();
-        await reportAction(page, before, `Clicked: ${args[0]}`);
       } else if (args[0] && args[1]) {
         const x = parseInt(args[0]), y = parseInt(args[1]);
         if (isNaN(x) || isNaN(y)) { console.error('Click: provide x y coordinates'); process.exit(1); }
@@ -1692,7 +1773,10 @@ async function main() {
         connected: node.isConnected,
         visible: node.offsetParent !== null,
         disabled: Boolean(node.disabled || node.getAttribute('aria-disabled') === 'true'),
-        editable: node.matches('input, textarea, [contenteditable="true"]')
+        // isContentEditable covers contenteditable="true" AND contenteditable=""
+        // (React's common form); the old [contenteditable="true"] check missed "".
+        editable: node.isContentEditable || node.matches('input, textarea'),
+        contentEditable: node.isContentEditable
       }));
       if (!fillState.connected || !fillState.visible || fillState.disabled || !fillState.editable) {
         await handle.dispose();
@@ -1710,8 +1794,14 @@ async function main() {
       const actualValue = await handle.evaluate(node => node.isContentEditable ? node.textContent : node.value);
       await handle.dispose();
       if (actualValue !== value) {
-        console.error(`Fill verification failed for ${selector}: expected ${JSON.stringify(value)}, got ${JSON.stringify(actualValue)}`);
-        process.exit(1);
+        if (fillState.contentEditable) {
+          // Rich editors (Draft.js, ProseMirror) normalize/transform input, so
+          // exact equality can't be guaranteed — warn instead of hard-failing.
+          console.warn(`Fill verification: expected ${JSON.stringify(value)}, got ${JSON.stringify(actualValue)} — rich editors may transform input; continuing`);
+        } else {
+          console.error(`Fill verification failed for ${selector}: expected ${JSON.stringify(value)}, got ${JSON.stringify(actualValue)}`);
+          process.exit(1);
+        }
       }
       await reportAction(page, before, `Filled "${label}" with "${value}" (verified)`);
       break;
@@ -1780,11 +1870,11 @@ async function main() {
         console.error(`Element not found: ${target}`);
         process.exit(1);
       }
-      const hoverState = await handle.evaluate(node => ({
+      const hoverState = await withTimeout(handle.evaluate(node => ({
         connected: node.isConnected,
         visible: node.offsetParent !== null,
         disabled: Boolean(node.disabled || node.getAttribute('aria-disabled') === 'true')
-      }));
+      })), 5000, 'hover:state');
       if (!hoverState.connected || !hoverState.visible || hoverState.disabled) {
         await handle.dispose();
         console.error(`Element is not hoverable: ${target}`);
@@ -1792,7 +1882,23 @@ async function main() {
       }
       const before = await captureSignals(page);
       resetReactionEvents();
-      await handle.hover();
+      // Never use puppeteer's ElementHandle.hover() here: it runs CDP
+      // DOM.scrollIntoViewIfNeeded internally, which blocked indefinitely on
+      // Zhihu's long/dynamic DOM (observed: 90s hang in the "connected" phase,
+      // only the watchdog killed it). resolveRef already scrolled the element
+      // into view, so moving the real mouse to the box center is equivalent
+      // and cannot hang.
+      const box = await withTimeout(handle.boundingBox(), 5000, 'hover:boundingBox');
+      if (box) {
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      } else {
+        const pt = await withTimeout(handle.evaluate(node => {
+          node.scrollIntoView({ block: 'center', inline: 'center' });
+          const r = node.getBoundingClientRect();
+          return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+        }), 5000, 'hover:rect').catch(() => null);
+        if (pt) await page.mouse.move(pt.x, pt.y);
+      }
       await handle.dispose();
       await reportAction(page, before, `Hovered "${label}"`);
       break;
@@ -1871,19 +1977,25 @@ async function main() {
       const { handle, label } = await resolveTarget(page, target);
       const before = await captureSignals(page);
       resetReactionEvents();
-      const res = await handle.evaluate((el, text) => {
-        if (!el.isContentEditable) return { error: 'element is not contenteditable' };
-        el.focus();
-        el.textContent = text;
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-        return { text: el.textContent.slice(0, 80) };
-      }, value);
-      await handle.dispose();
-      if (res.error) {
-        console.error(`contenteditable ${label}: ${res.error}`);
+      const editable = await withTimeout(handle.evaluate(el => Boolean(el.isContentEditable)), 5000, 'contenteditable:check');
+      if (!editable) {
+        await handle.dispose();
+        console.error(`contenteditable ${label}: element is not contenteditable`);
         process.exit(1);
       }
-      await reportAction(page, before, `Filled contenteditable ${label} -> "${res.text}"`);
+      // Draft.js / React controlled editors (Zhihu's comment composer) ignore
+      // direct textContent mutation + InputEvent — observed as broken editor
+      // state, spliced text, and dropped digits. The only reliable path is
+      // real keystrokes: focus -> select-all -> delete -> type.
+      await handle.evaluate(el => el.focus());
+      await page.keyboard.down('Control');
+      await page.keyboard.press('A');
+      await page.keyboard.up('Control');
+      await page.keyboard.press('Backspace');
+      await page.keyboard.type(value, { delay: 10 });
+      const typed = await handle.evaluate(el => (el.textContent || el.innerText || '').trim().slice(0, 80));
+      await handle.dispose();
+      await reportAction(page, before, `Filled contenteditable ${label} -> "${typed}"`);
       break;
     }
 
