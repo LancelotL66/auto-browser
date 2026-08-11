@@ -1862,19 +1862,24 @@ async function main() {
         console.error(`contenteditable ${label}: element is not contenteditable`);
         process.exit(1);
       }
-      // Draft.js / React controlled editors (Zhihu's comment composer) ignore
-      // direct textContent mutation + InputEvent — observed as broken editor
-      // state, spliced text, and dropped digits. The only reliable path is
-      // real keystrokes: focus -> select-all -> delete -> type.
+      // Draft.js / React controlled editors ignore key events and direct
+      // textContent mutation; execCommand insertText goes through the
+      // browser's editing pipeline (beforeinput/input) and handles CJK +
+      // digits without IME loss — verified on Zhihu's comment composer.
       await handle.evaluate(el => el.focus());
-      await page.keyboard.down('Control');
-      await page.keyboard.press('A');
-      await page.keyboard.up('Control');
-      await page.keyboard.press('Backspace');
-      await page.keyboard.type(value, { delay: 10 });
-      const typed = await handle.evaluate(el => (el.textContent || el.innerText || '').trim().slice(0, 80));
+      const ok = await page.evaluate((text) => {
+        try {
+          document.execCommand('selectAll', false, null);
+          document.execCommand('insertText', false, text);
+          return true;
+        } catch { return false; }
+      }, value);
+      await new Promise(r => setTimeout(r, 250));
+      const typed = ok
+        ? await handle.evaluate(el => (el.textContent || el.innerText || '').trim().slice(0, 80))
+        : '';
       await handle.dispose();
-      await reportAction(page, before, `Filled contenteditable ${label} -> "${typed}"`);
+      await reportAction(page, before, `Filled contenteditable ${label} -> "${typed}" (execCommand)`);
       break;
     }
 

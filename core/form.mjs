@@ -100,14 +100,14 @@ export async function fillContentEditable(page, selector, value) {
     await handle.dispose();
     throw new Error('Element is not contenteditable');
   }
-  // Draft.js / React controlled editors ignore direct textContent mutation;
-  // real keystrokes are the only reliable input path.
+  // Draft.js / React controlled editors ignore key events and textContent
+  // mutation; execCommand insertText goes through the browser's editing
+  // pipeline (fires beforeinput/input) — the reliable input path.
   await handle.evaluate(el => el.focus());
-  await page.keyboard.down('Control');
-  await page.keyboard.press('A');
-  await page.keyboard.up('Control');
-  await page.keyboard.press('Backspace');
-  await page.keyboard.type(value, { delay: 10 });
+  await page.evaluate((text) => {
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, text);
+  }, value);
   await handle.dispose();
   return true;
 }

@@ -395,16 +395,26 @@ async function runOp(page, step, ctx) {
         const editable = await handle.evaluate(el => Boolean(el.isContentEditable));
         if (!editable) throw new Error('element is not contenteditable');
         const before = await quickSnapshot(page);
-        // Real keystrokes: Draft.js / React editors ignore textContent mutation.
+        // execCommand insertText is the ONLY reliable input path for
+        // Draft.js / React controlled editors: key events are ignored by
+        // Draft.js (observed: nothing enters), textContent mutation bypasses
+        // the framework. insertText goes through the browser's editing
+        // pipeline (fires beforeinput/input with data) and handles CJK +
+        // digits without IME composition loss.
         await handle.evaluate(el => el.focus());
-        await page.keyboard.down('Control');
-        await page.keyboard.press('A');
-        await page.keyboard.up('Control');
-        await page.keyboard.press('Backspace');
-        await page.keyboard.type(step.value, { delay: step.delay ?? 10 });
-        const typed = await handle.evaluate(el => (el.textContent || el.innerText || '').trim().slice(0, 80));
+        const ok = await page.evaluate((text) => {
+          try {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, text);
+            return true;
+          } catch { return false; }
+        }, step.value);
+        await sleep(250);
+        const typed = ok
+          ? await handle.evaluate(el => (el.textContent || el.innerText || '').trim().slice(0, 80))
+          : '';
         const diff = await observeAction(page, before, { fast: step.fast });
-        return { label, value: typed, changed: diff.changed };
+        return { label, value: typed, input: 'execCommand', changed: diff.changed };
       } finally {
         await handle.dispose().catch(() => {});
       }
