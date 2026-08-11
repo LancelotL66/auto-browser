@@ -50,6 +50,8 @@ import { selectValue, setChecked, fillContentEditable } from '../core/form.mjs';
 import { waitForSelector, waitForText, waitForUrl, waitForDomStable } from '../core/wait.mjs';
 import { diffMaps } from '../core/diff.mjs';
 import { launchChrome, closeChrome, chromeStatus } from '../core/launcher.mjs';
+import { parseRef as _parseRef, resolveRef as _resolveRef, resolveTarget as _resolveTarget } from '../core/locate.mjs';
+import { executePlan, PLAN_OPS } from '../core/plan.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -122,166 +124,18 @@ function printKinds(kinds) {
   console.log(`Kinds: ${parts.join('  ')}`);
 }
 
-function parseRef(value) {
-  if (!value?.startsWith('@')) return null;
-  const raw = value.slice(1);
-  const frameMatch = raw.match(/^f(\d+)-e(\d+)$/);
-  if (frameMatch) {
-    return { ref: raw, frameIndex: Number.parseInt(frameMatch[1], 10) - 1 };
-  }
-  const number = raw.startsWith('e') ? raw.slice(1) : raw;
-  const index = Number.parseInt(number, 10);
-  return Number.isInteger(index) && index > 0 ? { ref: `e${index}`, frameIndex: null } : null;
-}
-
-async function resolveRef(page, value) {
-  const parsed = parseRef(value);
-  if (!parsed) return null;
-
-  const index = _lastElements.findIndex(element => element.ref === parsed.ref);
-  if (index < 0) return null;
-  const element = _lastElements[index];
-  let context = page;
-  if (parsed.frameIndex !== null) {
-    const frames = page.frames().filter(frame => frame !== page.mainFrame());
-    context = frames[parsed.frameIndex];
-    if (!context) return null;
-  }
-  let handle = null;
-  let method = null;
-  let confidence = 0;
-  if (element.locator?.shadow?.hostSelector) {
-    const shadowHandle = await page.evaluateHandle(({ hostSelector, selector }) => {
-      const host = document.querySelector(hostSelector);
-      return host?.shadowRoot?.querySelector(selector) || null;
-    }, element.locator.shadow);
-    handle = shadowHandle.asElement();
-    if (!handle) await shadowHandle.dispose();
-    else {
-      method = 'shadow-dom';
-      confidence = 100;
-    }
-  }
-  if (!handle && element.locator?.selector) {
-    handle = await context.$(element.locator.selector);
-    if (handle) {
-      method = 'css';
-      confidence = 100;
-    }
-  }
-  if (!handle && element.locator?.xpath) {
-    handle = await context.$(`xpath${element.locator.xpath}`);
-    if (handle) {
-      method = 'xpath';
-      confidence = 90;
-    }
-  }
-  if (!handle) {
-    const match = await context.evaluate(({ tag, role, name, text, placeholder, rect, parentText }) => {
-      const visible = node => {
-        const rect = node.getBoundingClientRect();
-        return node.offsetParent !== null && rect.width > 0 && rect.height > 0;
-      };
-      const candidates = [...document.querySelectorAll('*')]
-        .filter(node => visible(node))
-        .filter(node => !tag || node.tagName === tag);
-      const accessibleName = node => node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent.trim();
-      const path = node => {
-        const parts = [];
-        for (let current = node; current && current.nodeType === 1; current = current.parentElement) {
-          let index = 1;
-          for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
-            if (sibling.tagName === current.tagName) index++;
-          }
-          parts.unshift(`${current.tagName.toLowerCase()}[${index}]`);
-        }
-        return `/${parts.join('/')}`;
-      };
-      const distance = (a, b) => Math.hypot((a.x || 0) - (b.x || 0), (a.y || 0) - (b.y || 0));
-      const interactive = node => {
-        const t = node.tagName;
-        if (['BUTTON', 'A', 'INPUT', 'TEXTAREA', 'SELECT', 'LABEL', 'OPTION'].includes(t)) return true;
-        if (node.getAttribute('role') || node.isContentEditable) return true;
-        if (node.hasAttribute('onclick') || node.hasAttribute('tabindex')) return true;
-        const cls = typeof node.className === 'string' ? node.className : '';
-        return /(el-button|ant-btn|MuiButton|el-select|ant-select|el-input|el-checkbox|el-radio|el-switch|el-tabs|el-dropdown|el-upload|Mui[A-Z]|btn|clickable|cursor-pointer)/.test(cls);
-      };
-      const scored = candidates.map(node => {
-        const currentRect = node.getBoundingClientRect();
-        const currentName = accessibleName(node);
-        const currentParent = node.parentElement?.textContent.trim().slice(0, 120) || '';
-        let score = 0;
-        if (role && node.getAttribute('role') === role) score += 35;
-        if (name && currentName === name) score += 45;
-        else if (name && currentName && currentName.includes(name)) score += 5;
-        if (text && node.textContent.trim() === text) score += 15;
-        if (placeholder && node.getAttribute('placeholder') === placeholder) score += 25;
-        if (parentText && currentParent === parentText) score += 10;
-        const positionDistance = distance(currentRect, rect);
-        if (positionDistance < 40) score += 15;
-        else if (positionDistance < 150) score += 8;
-        else if (positionDistance < 400) score -= 20;
-        else score -= 40;   // far away: needs a very strong identity match
-        // Stat/counter text ("12.6k", "1,024", "294") is almost never the target.
-        if (/^[\d.,+\-%\s万kKmM倍条个赞人/]*$/.test(currentName.slice(0, 40))) score -= 25;
-        // Non-interactive text nodes must not outscore the real control.
-        if (!interactive(node)) score -= 40;
-        if (node.disabled || node.getAttribute('aria-disabled') === 'true') score -= 25;
-        return { node, score, xpath: path(node) };
-      }).sort((a, b) => b.score - a.score);
-      const best = scored[0];
-      return best ? { xpath: best.xpath, score: best.score, candidates: scored.length } : null;
-    }, {
-      tag: element.tag,
-      role: element.role,
-      name: element.name,
-      text: element.text,
-      placeholder: element.placeholder,
-      rect: element.rect,
-      parentText: element.parentText
-    });
-    if (match && match.score >= 60) {
-      handle = await context.$(`xpath${match.xpath}`);
-      if (handle) {
-        method = `semantic (${match.candidates} candidates)`;
-        confidence = match.score;
-      }
-    } else if (match) {
-      console.warn(`Warning: ${value} — nearest semantic candidate scored ${match.score} (< 60). The page likely changed structurally; run "snap" to rebuild references instead of clicking a guess.`);
-    }
-  }
-  if (handle) {
-    await handle.evaluate(node => node.scrollIntoView({ block: 'center', inline: 'center' }));
-  }
-  return handle ? { handle, element, index, method, confidence } : null;
+// @ref resolution lives in core/locate.mjs, shared with the plan runner
+// (core/plan.mjs) and the MCP server. Thin wrappers keep the CLI's
+// process.exit error behavior and bind the snapshot element store.
+function parseRef(value) { return _parseRef(value); }
+function resolveRef(page, value) { return _resolveRef(page, value, _lastElements); }
+function resolveTarget(page, target) {
+  return _resolveTarget(page, target, _lastElements, {
+    onError: (msg) => { console.error(msg); process.exit(1); }
+  });
 }
 
 const [,, cmd, ...args] = process.argv;
-
-// ------------------------------------------------------------
-// Resolve either an @ref (from the last snap/find) or a raw CSS
-// selector into an element handle. Lets every action command
-// accept both forms interchangeably.
-// ------------------------------------------------------------
-async function resolveTarget(page, target) {
-  if (target.startsWith('@')) {
-    const resolved = await resolveRef(page, target);
-    if (!resolved) {
-      console.error(`Element not found: ${target}. Run "snap" or "find" first.`);
-      process.exit(1);
-    }
-    if (resolved.confidence < 80) {
-      console.warn(`Warning: ${target} matched with confidence ${resolved.confidence} via ${resolved.method}`);
-    }
-    return { handle: resolved.handle, label: `@${resolved.element.ref}`, element: resolved.element };
-  }
-  const handle = await page.$(target);
-  if (!handle) {
-    console.error(`Element not found: ${target}`);
-    process.exit(1);
-  }
-  return { handle, label: target, element: null };
-}
 
 // ============================================================
 // Helper: connect to browser
@@ -910,6 +764,9 @@ Your browser is the API. No keys. No bots. No scrapers.
   eval --file <path.js>  Run JS from a file (avoids shell quote mangling)
   eval --stdin           Run JS piped from stdin
   get <attr>             Get page attribute (title, url, html, text)
+  run <plan.json>        Execute a batch plan (JSON array of steps) in ONE call
+  run --stdin            Read the plan from stdin (ops: open wait snap click fill
+                         select check contenteditable type eval extract assert ...)
 
 === Interaction (每个命令都接受 @ref 或 CSS selector) ===
   click <@ref|sel>       Click element (or: click <x> <y> for coordinates)
@@ -976,6 +833,28 @@ Examples:
 Note: every command auto-launches Chrome if it isn't running, so
 "launch" is optional — use it when you want an explicit/fresh start.
 `.trim());
+}
+
+// Compact one-line summary of a plan step result (for `run` output).
+function summarizeStepResult(r) {
+  const res = r.result || {};
+  switch (r.op) {
+    case 'open': return `${res.url || ''}${res.title ? ' — ' + String(res.title).slice(0, 40) : ''}`;
+    case 'snap': return `${res.elementCount} elements${res.kinds ? ' (' + Object.entries(res.kinds).map(([k, n]) => `${k}=${n}`).join(' ') + ')' : ''}`;
+    case 'links': return `${res.count} links`;
+    case 'extract': return `${res.count} items`;
+    case 'click': return `${res.label || ''}${res.retried ? ' [js-fallback]' : ''}${res.changed ? ' changed' : ' no-change'}${res.verdict ? ' verdict="' + res.verdict + '"' : ''}`;
+    case 'fill':
+    case 'contenteditable': return `${res.label || ''} = "${String(res.value || '').slice(0, 30)}"${res.verified ? ' (verified)' : ''}`;
+    case 'select': return `${res.label || ''} -> ${res.option || ''}`;
+    case 'check':
+    case 'uncheck': return `${res.label || ''} checked=${res.checked}`;
+    case 'wait':
+    case 'assert': return `${res.asserted || res.kind || ''} "${res.target || ''}"`;
+    case 'eval': return typeof res.result === 'string' ? res.result.slice(0, 80) : JSON.stringify(res.result)?.slice(0, 80) || '';
+    case 'type': return `"${res.text || ''}"`;
+    default: return '';
+  }
 }
 
 // ============================================================
@@ -2134,6 +2013,81 @@ async function main() {
         }
         default:
           console.log('Usage: auto-browser cache [list|clear]');
+      }
+      break;
+    }
+
+    // ==================== RUN ====================
+    // run <plan.json> | --stdin | <inline JSON>  — batch plan executor.
+    // Executes N steps in ONE process / ONE CDP connection. The agent
+    // thinks once, writes the plan, gets back compact per-step results:
+    // no per-command process startup, no inter-step round trips.
+    case 'run': {
+      const fileArg = args.find(a => a.startsWith('--file='));
+      const fileFlagIndex = args.indexOf('--file');
+      let planText = '';
+      if (fileArg) {
+        planText = fs.readFileSync(fileArg.split('=').slice(1).join('='), 'utf8');
+      } else if (fileFlagIndex >= 0 && args[fileFlagIndex + 1]) {
+        planText = fs.readFileSync(args[fileFlagIndex + 1], 'utf8');
+      } else if (args.includes('--stdin') || args.includes('-')) {
+        planText = fs.readFileSync(0, 'utf8');
+      } else {
+        // Positional: a plan file path, or an inline JSON array.
+        const pos = args.filter(a => !a.startsWith('--'));
+        if (pos.length === 1 && fs.existsSync(pos[0])) {
+          planText = fs.readFileSync(pos[0], 'utf8');
+        } else {
+          planText = pos.join(' ');
+        }
+      }
+      if (!planText.trim()) {
+        console.error('Usage: auto-browser run <plan.json> | run --stdin | run <inline-json>');
+        console.error('  plan = JSON array of steps; ops: ' + PLAN_OPS.join(' '));
+        process.exit(1);
+      }
+      let plan;
+      try {
+        plan = JSON.parse(planText);
+      } catch (e) {
+        console.error(`run: invalid plan JSON: ${e.message}`);
+        process.exit(1);
+      }
+      if (!Array.isArray(plan)) {
+        console.error('run: plan must be a JSON array of steps, e.g. [{"op":"open","url":"..."}, {"op":"snap"}, {"op":"click","target":"@e3"}]');
+        process.exit(1);
+      }
+
+      const page = await getPage();
+      const outcome = await executePlan(page, plan, {
+        elements: _lastElements,
+        continueOnError: args.includes('--continue'),
+        fast: args.includes('--fast')
+      });
+      _lastElements = outcome.elements;
+      saveSnapshot({
+        url: page.url(),
+        title: await page.title().catch(() => ''),
+        elements: outcome.elements
+      });
+
+      if (args.includes('--json')) {
+        console.log(JSON.stringify(outcome, null, 2));
+        if (!outcome.ok) process.exitCode = 1;
+        break;
+      }
+      console.log(`run: ${outcome.executed}/${outcome.steps} steps, ${(outcome.ms / 1000).toFixed(1)}s`);
+      for (const r of outcome.results) {
+        const brief = summarizeStepResult(r);
+        if (r.ok) {
+          console.log(`  ✓ ${r.step}. ${r.op}${brief ? ' — ' + brief : ''} (${r.ms}ms)`);
+        } else {
+          console.log(`  ✗ ${r.step}. ${r.op} FAILED: ${r.error}${brief ? ' — ' + brief : ''} (${r.ms}ms)`);
+        }
+      }
+      if (!outcome.ok) {
+        console.log('  (run with --continue to execute remaining steps; --json for machine-readable output)');
+        process.exitCode = 1;
       }
       break;
     }
