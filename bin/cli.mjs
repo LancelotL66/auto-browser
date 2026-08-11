@@ -51,7 +51,7 @@ import { waitForSelector, waitForText, waitForUrl, waitForDomStable } from '../c
 import { diffMaps } from '../core/diff.mjs';
 import { launchChrome, closeChrome, chromeStatus } from '../core/launcher.mjs';
 import { parseRef as _parseRef, resolveRef as _resolveRef, resolveTarget as _resolveTarget } from '../core/locate.mjs';
-import { executePlan, PLAN_OPS } from '../core/plan.mjs';
+import { executePlan, PLAN_OPS, buildEvalPayload } from '../core/plan.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -183,14 +183,7 @@ function startLiveness(cmd, args) {
   const secs = process.env.AUTO_BROWSER_TIMEOUT !== undefined
     ? Number(process.env.AUTO_BROWSER_TIMEOUT)
     : 90;
-  if (secs > 0) {
-    _watchdog = setTimeout(() => {
-      const inPhase = ((Date.now() - _phaseAt) / 1000).toFixed(1);
-      console.error(`\n[watchdog] '${cmd}' exceeded ${secs}s — stuck in phase "${_phase}" for ${inPhase}s. Forcing exit; this is a hang, not slow work.`);
-      process.exit(124);
-    }, secs * 1000);
-    _watchdog.unref();
-  }
+  armWatchdog(secs);
 
   let ticks = 0;
   _heartbeat = setInterval(() => {
@@ -201,6 +194,21 @@ function startLiveness(cmd, args) {
     process.stderr.write(`[watch] ${total}s elapsed — phase "${_phase}" (${inPhase}s)\n`);
   }, 2000);
   _heartbeat.unref();
+}
+
+// (Re)arm the hard deadline. `run` re-scales it to the plan length so a
+// legit multi-step batch isn't killed by the 90s default while true hangs
+// are still caught.
+function armWatchdog(secs) {
+  if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
+  if (secs > 0) {
+    _watchdog = setTimeout(() => {
+      const inPhase = ((Date.now() - _phaseAt) / 1000).toFixed(1);
+      console.error(`\n[watchdog] '${cmd}' exceeded ${secs}s — stuck in phase "${_phase}" for ${inPhase}s. Forcing exit; this is a hang, not slow work.`);
+      process.exit(124);
+    }, secs * 1000);
+    _watchdog.unref();
+  }
 }
 
 function stopLiveness() {
@@ -1497,10 +1505,11 @@ async function main() {
 
       const page = await getPage();
 
-      // A file may contain statements/newlines, so wrap it in an async IIFE
-      // and let an explicit `return` produce the value.
-      const isExpression = source === 'inline' && !/[\n;]/.test(code.trim());
-      const payload = isExpression ? code : `(async () => { ${code}\n })()`;
+            // A file may contain statements/newlines. buildEvalPayload picks the
+            // right wrapper: single expression -> direct; explicit return/top-level
+            // await -> async IIFE; statement list -> eval completion value so the
+            // last expression becomes the result WITHOUT requiring `return`.
+            const payload = buildEvalPayload(code);
 
       let result;
       try {
@@ -2063,6 +2072,13 @@ async function main() {
         process.exit(1);
       }
 
+      // A legit multi-step batch can outlive the 90s default watchdog; scale
+      // the hard deadline to the plan length (30s/step) unless the user set
+      // AUTO_BROWSER_TIMEOUT explicitly.
+      if (process.env.AUTO_BROWSER_TIMEOUT === undefined) {
+        armWatchdog(Math.max(90, plan.length * 30));
+      }
+
       const page = await getPage();
       const outcome = await executePlan(page, plan, {
         elements: _lastElements,
@@ -2088,6 +2104,9 @@ async function main() {
           console.log(`  ✓ ${r.step}. ${r.op}${brief ? ' — ' + brief : ''} (${r.ms}ms)`);
         } else {
           console.log(`  ✗ ${r.step}. ${r.op} FAILED: ${r.error}${brief ? ' — ' + brief : ''} (${r.ms}ms)`);
+        }
+        if (r.newTab) {
+          console.log(`      ⚠ new tab/window opened (tabDelta ${r.tabDelta}) — the plan's page may no longer be the active context; add a probe/close step or handle the popup before continuing`);
         }
       }
       if (!outcome.ok) {

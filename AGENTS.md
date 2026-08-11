@@ -532,3 +532,37 @@ await closeChrome();
 - `diff` rebuilds and compares maps; it is not a live DOM mutation observer.
 - `daemon` and `mcp` do not yet enforce URL allow-lists or confirm high-risk actions.
 - Multi-tab snapshot lifecycles are not fully isolated.
+
+---
+
+## 11. Batch Workflow — 先跑通一次，再批量
+
+`run` executes a whole plan in ONE call (`auto-browser run plan.json`), but a
+new site always has surprises. The proven sequence (知乎实测, 2026-08):
+
+1. **单条冒烟（一条即可）** — 写一个覆盖完整链路的 plan（open → wait →
+   snap/probe → 关键交互 → assert），对**第 1 条**数据跑通：
+   ```bash
+   auto-browser run single-item.json
+   ```
+2. **适配中断源** — 逐个处理会打断批量操作的东西，全部反映在 plan 里：
+   - **新窗口/新标签**：某步点了 `target=_blank` 或弹窗后，plan 的 page 会脱离
+     当前上下文。`run` 输出会打 `⚠ new tab/window opened (tabDelta N)` 警告；
+     用 `{"op":"probe"}` 查看 tabs，必要时加 `tab close` 或改用稳定 selector。
+   - **停顿/加载慢**：`wait stable` / `wait text` 设足 timeout；`probe` 步骤报告
+     `pending`（"加载中/评测中…"）与 `masked`（遮罩层）。
+   - **弹窗/登录墙**：交互步骤的 reaction 会报 `modal`/`masked`；出现即视为
+     中断源，在 plan 里前置处理或要求人工。
+   - **键盘/编辑器怪癖**：Draft.js 类编辑器只认 `execCommand('insertText')`
+     （contenteditable 步骤已内置）；按钮类名变化用 `snap` 看真实 class。
+3. **先验验证通道** — 单条跑通后确认"如何证明成功"（like 状态、评论总数增量、
+   DOM 断言、站点 API）。批量时每项后跟一个 verify 步骤或独立验证计划。
+4. **再批量** — 循环同一 plan（或每项生成的 plan），逐项计时；`--continue`
+   容忍单项失败，`--json` 拿结构化结果。watchdog 会按 plan 长度自动缩放
+   （30s/步），不必手工调 `AUTO_BROWSER_TIMEOUT`。
+5. **沉淀适配器** — 踩过的选择器/API/交互策略写进 `site/registry/<site>.mjs`
+   （参考 `zhihu.mjs`：action=search/like/comment/likeAndComment/comments/probe），
+   下次同站零成本。
+
+经验值（知乎 10 条实测）：单条链路（探测+交互+验证）≈ 12s；批量 10 条 ≈ 2.2min；
+而逐步 CLI + 逐次思考 ≈ 20-40min。中断源排查占首次适配的大头——这正是第 1、2 步要解决的事。

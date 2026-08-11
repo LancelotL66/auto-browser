@@ -26,7 +26,7 @@ import path from 'path';
 export const PLAN_OPS = [
   'open', 'wait', 'sleep', 'snap', 'links', 'get', 'eval', 'evalFile',
   'click', 'fill', 'select', 'check', 'uncheck', 'contenteditable',
-  'type', 'scroll', 'extract', 'assert', 'screenshot'
+  'type', 'scroll', 'extract', 'assert', 'screenshot', 'probe'
 ];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -67,6 +67,19 @@ async function quickSnapshot(page) {
       let h = 0;
       const n = Math.min(body.length, 200000);
       for (let i = 0; i < n; i++) h = (h * 31 + body.charCodeAt(i)) >>> 0;
+      // Async work in flight? Matches explicit status text/loaders only —
+      // deliberately NOT generic [class*=loading] (rich editors and decorative
+      // spinners are always present and would make every page look busy).
+      const PENDING_RE = /评测中|判题中|运行中|提交中|加载中|排队中|正在为你查询结果|正在查询|结果生成中|正在评测|正在提交|Judging|Running\b|Pending|Evaluating|Submitting/i;
+      let pending = false;
+      const pnodes = document.querySelectorAll('span, div, button, p, i, b, [class*="btn"]');
+      for (let i = 0; i < pnodes.length && !pending; i++) {
+        const e = pnodes[i];
+        if (e.children.length > 0) continue;
+        if (!visible(e)) continue;
+        const t = norm(e.innerText || e.textContent);
+        if (t && t.length <= 20 && PENDING_RE.test(t)) pending = true;
+      }
       return {
         url: location.href,
         title: document.title,
@@ -76,6 +89,7 @@ async function quickSnapshot(page) {
         toasts: texts('.el-message,.el-notification,.ant-message-notice,.ant-notification-notice,.Toastify__toast,.MuiAlert-message,[role="status"]'),
         errors: texts('.el-form-item__error,.ant-form-item-explain-error,.invalid-feedback,.error-message,.is-error,.text-danger'),
         modals: texts('[role="dialog"],[aria-modal="true"],.el-dialog,.el-message-box,.ant-modal,.MuiDialog-paper,.modal.show'),
+        pending,
         masked: (() => {
           const nodes = document.querySelectorAll('div, section');
           for (let i = 0; i < nodes.length; i++) {
@@ -154,18 +168,66 @@ function compactElements(elements, limit = 50) {
 }
 
 // ------------------------------------------------------------
-// Run ONE step. ctx: { elements (ref store, in/out), fast, log }.
-// Returns { op, ok, ms, error?, result? }.
+// Build the page.evaluate payload for arbitrary JS.
+// The old wrap `(async () => { code })()` silently DISCARDS the value
+// unless the code ends with an explicit `return` — a recurring trap
+// (a whole batch run was lost to it). Rules:
+//   - single expression            -> evaluated directly
+//   - has top-level `return`/await -> plain async IIFE wrap (as before)
+//   - statement list without them  -> eval()'s completion value returns the
+//     last expression automatically (verified: eval('const a=1; a+41') -> 42;
+//     note eval does NOT support top-level await, hence the branch above)
+// ------------------------------------------------------------
+export function buildEvalPayload(code) {
+  const trimmed = String(code ?? '').trim();
+  if (!trimmed) return trimmed;
+  const hasReturn = /(^|\n)\s*return\b/.test('\n' + trimmed);
+  const hasAwait = /(^|\n)\s*await\b/.test('\n' + trimmed);
+  const singleExpr = !/[\n;]/.test(trimmed);
+  // Single await-expression: `await fetch(url).then(...)` — the async wrapper
+  // needs an explicit `return` or the awaited value is discarded.
+  if (singleExpr && hasAwait) return `(async () => { return ${trimmed}\n })()`;
+  if (singleExpr) return trimmed;
+  if (hasReturn) return `(async () => { ${trimmed}\n })()`;
+  if (!hasAwait) {
+    try {
+      new Function(trimmed); // syntax gate before relying on eval
+      return `(async () => { return eval(${JSON.stringify(trimmed)}); })()`;
+    } catch { /* fall through to plain wrap */ }
+  }
+  return `(async () => { ${trimmed}\n })()`;
+}
+
+// ------------------------------------------------------------
+// Run ONE step. ctx: { elements (ref store, in/out), fast, log, baselineTabs }.
+// Returns { op, ok, ms, error?, result?, newTab?, tabDelta? }.
 // ------------------------------------------------------------
 export async function executeStep(page, step, ctx = {}) {
   const started = Date.now();
   const base = { op: step.op };
   try {
     const r = await runOp(page, step, ctx);
-    return { ...base, ok: true, ms: Date.now() - started, result: r };
+    const out = { ...base, ok: true, ms: Date.now() - started, result: r };
+    return await withTabCheck(page, ctx, out);
   } catch (e) {
     return { ...base, ok: false, ms: Date.now() - started, error: e.message };
   }
+}
+
+// Did this step spawn/close a tab? A popup opening mid-plan silently moves
+// the browser's "active" context away from the plan's page — flag it so the
+// agent can adapt (close the tab / re-target) instead of acting on a stale page.
+async function withTabCheck(page, ctx, out) {
+  if (ctx.baselineTabs == null) return out;
+  try {
+    const count = (await page.browser().pages()).length;
+    if (count !== ctx.baselineTabs) {
+      out.newTab = count > ctx.baselineTabs;
+      out.tabDelta = count - ctx.baselineTabs;
+      ctx.baselineTabs = count; // track the new reality for later steps
+    }
+  } catch { /* browser may be mid-navigation */ }
+  return out;
 }
 
 async function runOp(page, step, ctx) {
@@ -248,9 +310,7 @@ async function runOp(page, step, ctx) {
     case 'eval': {
       const code = step.code;
       if (!code) throw new Error('eval: missing "code"');
-      const isExpression = !/[\n;]/.test(String(code).trim());
-      const payload = isExpression ? code : `(async () => { ${code}\n })()`;
-      const result = await page.evaluate(payload);
+      const result = await page.evaluate(buildEvalPayload(code));
       return { result };
     }
 
@@ -258,7 +318,7 @@ async function runOp(page, step, ctx) {
       const p = step.path || step.file;
       if (!p) throw new Error('evalFile: missing "path"');
       const code = fs.readFileSync(p, 'utf8');
-      const result = await page.evaluate(`(async () => { ${code}\n })()`);
+      const result = await page.evaluate(buildEvalPayload(code));
       return { result };
     }
 
@@ -485,6 +545,28 @@ async function runOp(page, step, ctx) {
       return { base64: buffer.toString('base64'), bytes: buffer.length };
     }
 
+    case 'probe': {
+      // Checkpoint step: browser-level + page-level state. Use it in a
+      // single-item dry run BEFORE a full batch to adapt to interruption
+      // sources: new tabs/windows, dialogs, overlays, async stalls.
+      const pages = await page.browser().pages().catch(() => []);
+      const snap = await quickSnapshot(page);
+      const tabList = [];
+      for (const p of pages.slice(0, 10)) {
+        try { tabList.push(p.url().slice(0, 100)); } catch { tabList.push('(closed)'); }
+      }
+      return {
+        tabs: pages.length,
+        tabUrls: tabList,
+        url: snap?.url || page.url(),
+        title: snap?.title || '',
+        dialogs: snap?.modals?.length || 0,
+        modals: (snap?.modals || []).slice(0, 3),
+        masked: snap?.masked || false,
+        pending: snap?.pending || false
+      };
+    }
+
     default:
       throw new Error(`unknown op "${step.op}" (supported: ${PLAN_OPS.join(', ')})`);
   }
@@ -501,6 +583,8 @@ export async function executePlan(page, plan, opts = {}) {
     fast: !!opts.fast,
     log: opts.log || (() => {})
   };
+  // Tab baseline for new-window/popup detection across the whole plan.
+  try { ctx.baselineTabs = (await page.browser().pages()).length; } catch { ctx.baselineTabs = null; }
   const results = [];
   const started = Date.now();
   for (let i = 0; i < plan.length; i++) {
